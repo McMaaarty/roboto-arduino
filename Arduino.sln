@@ -1,0 +1,29 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.5.2.0
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "robot_mapper_pc", "robot_mapper_pc", "{BCDB568B-2DA8-6E03-BDD8-3568C25EDCA0}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RobotMapper", "robot_mapper_pc\RobotMapper\RobotMapper.csproj", "{F0E60E66-280C-8DE0-270E-F21489C7BEAF}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{F0E60E66-280C-8DE0-270E-F21489C7BEAF}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{F0E60E66-280C-8DE0-270E-F21489C7BEAF}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{F0E60E66-280C-8DE0-270E-F21489C7BEAF}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{F0E60E66-280C-8DE0-270E-F21489C7BEAF}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{F0E60E66-280C-8DE0-270E-F21489C7BEAF} = {BCDB568B-2DA8-6E03-BDD8-3568C25EDCA0}
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {1F987217-57C3-4610-9FEC-DDFCA2A1AB0C}
+	EndGlobalSection
+EndGlobal
