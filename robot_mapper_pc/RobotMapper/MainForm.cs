@@ -6,6 +6,7 @@ using System.Globalization;
 using System.IO.Ports;
 using System.Linq;
 using System.Text;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace RobotMapper;
@@ -80,6 +81,27 @@ public sealed class MainForm : Form
 
     private readonly System.Windows.Forms.Timer _timerRafraichissement = new() { Interval = IntervalleRafraichissementUiMs };
 
+    // UI tableau de bord (télémétrie + feedback)
+    private readonly StatusStrip _barreStatut = new() { SizingGrip = false };
+    private readonly ToolStripStatusLabel _statutPrincipal = new() { Spring = true, TextAlign = ContentAlignment.MiddleLeft };
+    private readonly ToolStripStatusLabel _statutSecondaire = new() { TextAlign = ContentAlignment.MiddleRight };
+
+    private readonly ListBox _listeActions = new() { Dock = DockStyle.Top, Height = 92 };
+    private readonly Queue<string> _historiqueActions = new();
+
+    private readonly Panel _panneauTableauDeBord = new() { Dock = DockStyle.Fill };
+    private readonly Panel _voyantConnexion = new() { Width = 12, Height = 12 };
+    private readonly Panel _voyantTelemetrie = new() { Width = 12, Height = 12 };
+    private readonly Label _valPort = new() { AutoSize = true };
+    private readonly Label _valConnexion = new() { AutoSize = true };
+    private readonly Label _valX = new() { AutoSize = true };
+    private readonly Label _valY = new() { AutoSize = true };
+    private readonly Label _valYaw = new() { AutoSize = true };
+    private readonly Label _valDistance = new() { AutoSize = true };
+    private readonly Label _valMode = new() { AutoSize = true };
+    private readonly Label _valAgeTelemetrie = new() { AutoSize = true };
+    private readonly Label _valRxTx = new() { AutoSize = true };
+
     private bool EstConnecte => _portSerie is not null && _portSerie.IsOpen;
 
     public MainForm()
@@ -98,20 +120,104 @@ public sealed class MainForm : Form
 
         InitialiserBitmap();
 
-        var top = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 40, Padding = new Padding(8), WrapContents = false };
-        top.Controls.Add(new Label { Text = "COM:", AutoSize = true, TextAlign = ContentAlignment.MiddleLeft, Padding = new Padding(0, 8, 0, 0) });
-        top.Controls.Add(_comboPortsCom);
-        top.Controls.Add(_boutonRafraichir);
-        top.Controls.Add(_boutonConnecter);
-        top.Controls.Add(_boutonDeconnecter);
-        top.Controls.Add(_boutonStream);
-        top.Controls.Add(_boutonAuto);
-        top.Controls.Add(_boutonPing);
-        top.Controls.Add(_labelStatut);
+        // Style “cockpit” (sobre) : fond sombre + contrôles plats.
+        BackColor = Color.FromArgb(18, 18, 18);
+        ForeColor = Color.Gainsboro;
 
-        Controls.Add(_panneauCarte);
-        Controls.Add(top);
-        Controls.Add(_zoneLog);
+        AppliquerStyleBouton(_boutonRafraichir);
+        AppliquerStyleBouton(_boutonConnecter);
+        AppliquerStyleBouton(_boutonDeconnecter);
+        AppliquerStyleBouton(_boutonStream);
+        AppliquerStyleBouton(_boutonAuto);
+        AppliquerStyleBouton(_boutonPing);
+
+        _comboPortsCom.BackColor = Color.FromArgb(30, 30, 30);
+        _comboPortsCom.ForeColor = Color.Gainsboro;
+
+        _zoneLog.BackColor = Color.FromArgb(12, 12, 12);
+        _zoneLog.ForeColor = Color.Gainsboro;
+        _zoneLog.BorderStyle = BorderStyle.FixedSingle;
+
+        _listeActions.BackColor = Color.FromArgb(12, 12, 12);
+        _listeActions.ForeColor = Color.Gainsboro;
+        _listeActions.BorderStyle = BorderStyle.FixedSingle;
+
+        // Barre d'outils (haut)
+        var barreHaut = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            Height = 46,
+            Padding = new Padding(10, 8, 10, 8),
+            WrapContents = false,
+            BackColor = Color.FromArgb(24, 24, 24),
+        };
+        barreHaut.Controls.Add(new Label
+        {
+            Text = "COM",
+            AutoSize = true,
+            Padding = new Padding(0, 7, 6, 0),
+            ForeColor = Color.Gainsboro
+        });
+        barreHaut.Controls.Add(_comboPortsCom);
+        barreHaut.Controls.Add(_boutonRafraichir);
+        barreHaut.Controls.Add(_boutonConnecter);
+        barreHaut.Controls.Add(_boutonDeconnecter);
+        barreHaut.Controls.Add(Espace(10));
+        barreHaut.Controls.Add(_boutonStream);
+        barreHaut.Controls.Add(_boutonAuto);
+        barreHaut.Controls.Add(_boutonPing);
+        barreHaut.Controls.Add(Espace(12));
+        _labelStatut.ForeColor = Color.Silver;
+        barreHaut.Controls.Add(_labelStatut);
+
+        // Contenu central : carte (gauche) + tableau de bord (droite)
+        ConstruireTableauDeBord();
+        var splitCentre = new SplitContainer
+        {
+            Dock = DockStyle.Fill,
+            Orientation = Orientation.Vertical,
+            SplitterWidth = 6,
+            BackColor = Color.FromArgb(18, 18, 18),
+            FixedPanel = FixedPanel.Panel2,
+        };
+        splitCentre.Panel1.Controls.Add(_panneauCarte);
+        splitCentre.Panel2.Controls.Add(_panneauTableauDeBord);
+
+        // IMPORTANT : ne pas configurer min sizes / SplitterDistance dans le constructeur.
+        // Le SplitContainer n'a pas encore une taille stable (layout/DPI), ce qui peut provoquer
+        // l'exception "SplitterDistance doit se situer entre ...".
+        splitCentre.HandleCreated += (_, _) => ConfigurerSplitCentre(splitCentre, largeurTableauDeBordSouhaitee: 340);
+        splitCentre.SizeChanged += (_, _) => ConfigurerSplitCentre(splitCentre, largeurTableauDeBordSouhaitee: 340);
+
+        // Bas : historique actions (compact) + log
+        var bas = new Panel { Dock = DockStyle.Fill, BackColor = Color.FromArgb(18, 18, 18) };
+        bas.Controls.Add(_zoneLog);
+        bas.Controls.Add(_listeActions);
+        _zoneLog.Dock = DockStyle.Fill;
+
+        // Barre de statut (tout en bas)
+        _barreStatut.BackColor = Color.FromArgb(24, 24, 24);
+        _barreStatut.ForeColor = Color.Gainsboro;
+        _barreStatut.Items.Add(_statutPrincipal);
+        _barreStatut.Items.Add(_statutSecondaire);
+
+        // Layout global
+        var layout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 4,
+            BackColor = Color.FromArgb(18, 18, 18),
+        };
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 46));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 240));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 24));
+        layout.Controls.Add(barreHaut, 0, 0);
+        layout.Controls.Add(splitCentre, 0, 1);
+        layout.Controls.Add(bas, 0, 2);
+        layout.Controls.Add(_barreStatut, 0, 3);
+        Controls.Add(layout);
 
         _panneauCarte.Paint += PanneauCarteOnPaint;
         _panneauCarte.MouseClick += PanneauCarteOnMouseClick;
@@ -119,17 +225,58 @@ public sealed class MainForm : Form
         KeyDown += MainFormOnKeyDown;
         KeyUp += MainFormOnKeyUp;
 
-        _boutonRafraichir.Click += (_, _) => GestionErreurs.Executer(() => RafraichirListePorts(), "Rafraîchissement des ports COM", this);
-        _boutonConnecter.Click += (_, _) => GestionErreurs.Executer(() => Connecter(), "Connexion port série", this);
-        _boutonDeconnecter.Click += (_, _) => GestionErreurs.Executer(() => Deconnecter(), "Déconnexion port série", this, afficherDialogue: false);
-        _boutonStream.Click += (_, _) => GestionErreurs.Executer(() => EnvoyerLigne("M\n"), "Commande Stream (M)", this, afficherDialogue: false);
-        _boutonAuto.Click += (_, _) => GestionErreurs.Executer(() => EnvoyerLigne("A\n"), "Commande Auto (A)", this, afficherDialogue: false);
-        _boutonPing.Click += (_, _) => GestionErreurs.Executer(() => EnvoyerLigne("P\n"), "Commande Ping (P)", this, afficherDialogue: false);
+        _boutonRafraichir.Click += (_, _) =>
+            GestionErreurs.Executer(() =>
+            {
+                FlashBouton(_boutonRafraichir);
+                RafraichirListePorts();
+                NotifierAction("Ports COM rafraîchis");
+            }, "Rafraîchissement des ports COM", this);
+
+        _boutonConnecter.Click += (_, _) =>
+            GestionErreurs.Executer(() =>
+            {
+                FlashBouton(_boutonConnecter);
+                Connecter();
+            }, "Connexion port série", this);
+
+        _boutonDeconnecter.Click += (_, _) =>
+            GestionErreurs.Executer(() =>
+            {
+                FlashBouton(_boutonDeconnecter);
+                Deconnecter();
+                NotifierAction("Déconnecté");
+            }, "Déconnexion port série", this, afficherDialogue: false);
+
+        _boutonStream.Click += (_, _) =>
+            GestionErreurs.Executer(() =>
+            {
+                FlashBouton(_boutonStream);
+                EnvoyerLigne("M\n");
+                NotifierAction("Commande envoyée : M (stream)");
+            }, "Commande Stream (M)", this, afficherDialogue: false);
+
+        _boutonAuto.Click += (_, _) =>
+            GestionErreurs.Executer(() =>
+            {
+                FlashBouton(_boutonAuto);
+                EnvoyerLigne("A\n");
+                NotifierAction("Commande envoyée : A (auto)");
+            }, "Commande Auto (A)", this, afficherDialogue: false);
+
+        _boutonPing.Click += (_, _) =>
+            GestionErreurs.Executer(() =>
+            {
+                FlashBouton(_boutonPing);
+                EnvoyerLigne("P\n");
+                NotifierAction("Commande envoyée : P (ping)");
+            }, "Commande Ping (P)", this, afficherDialogue: false);
 
         _timerRafraichissement.Tick += (_, _) =>
             GestionErreurs.Executer(() =>
             {
                 MettreAJourTexteStatut();
+                MettreAJourTableauDeBord();
                 if (_rafraichissementEnAttente)
                 {
                     _rafraichissementEnAttente = false;
@@ -139,6 +286,248 @@ public sealed class MainForm : Form
         _timerRafraichissement.Start();
 
         RafraichirListePorts();
+        MettreAJourTableauDeBord();
+        NotifierAction("Prêt");
+    }
+
+    private static Control Espace(int largeur) => new Panel { Width = largeur, Height = 1 };
+
+    private static void ConfigurerSplitCentre(SplitContainer split, int largeurTableauDeBordSouhaitee)
+    {
+        if (split.Orientation != Orientation.Vertical)
+            return;
+
+        var largeurTotale = split.Width;
+        if (largeurTotale <= 0)
+            return;
+
+        // Objectif : éviter toute valeur invalide même si la fenêtre est petite / DPI scaling.
+        // On calcule des min sizes compatibles avec la largeur disponible.
+        const int panel1MinSouhaite = 420;
+        const int panel2MinSouhaite = 320;
+        const int minAbsolu = 140;
+
+        var largeurDisponible = Math.Max(0, largeurTotale - split.SplitterWidth);
+
+        var panel2Min = panel2MinSouhaite;
+        var panel1Min = panel1MinSouhaite;
+
+        if (panel1Min + panel2Min > largeurDisponible)
+        {
+            // Réduction simple : on garantit un minimum absolu, puis on donne le reste à Panel1.
+            panel2Min = Math.Max(minAbsolu, Math.Min(panel2MinSouhaite, largeurDisponible / 3));
+            panel1Min = Math.Max(minAbsolu, largeurDisponible - panel2Min);
+        }
+
+        // Calcule une SplitterDistance cible (Panel2 ~ largeur souhaitée) en respectant les min sizes.
+        var minDistance = panel1Min;
+        var maxDistance = largeurTotale - panel2Min - split.SplitterWidth;
+        if (maxDistance < minDistance)
+            return;
+
+        var distanceVoulue = largeurTotale - largeurTableauDeBordSouhaitee - split.SplitterWidth;
+        var distanceClampee = Math.Max(minDistance, Math.Min(maxDistance, distanceVoulue));
+
+        // Astuce anti-exception : on pose d'abord une distance valide (min sizes actuels sont encore permissifs),
+        // puis on fixe les min sizes. Ainsi, ApplyPanel2MinSize n'a pas besoin de corriger vers une valeur invalide.
+        if (split.SplitterDistance < 0 || split.SplitterDistance > largeurTotale)
+            split.SplitterDistance = distanceClampee;
+        else if (Math.Abs(split.SplitterDistance - distanceClampee) > 40)
+            split.SplitterDistance = distanceClampee;
+
+        if (split.Panel1MinSize != panel1Min)
+            split.Panel1MinSize = panel1Min;
+        if (split.Panel2MinSize != panel2Min)
+            split.Panel2MinSize = panel2Min;
+    }
+
+    private static void AppliquerStyleBouton(Button bouton)
+    {
+        bouton.FlatStyle = FlatStyle.Flat;
+        bouton.FlatAppearance.BorderSize = 1;
+        bouton.FlatAppearance.BorderColor = Color.FromArgb(70, 70, 70);
+        bouton.BackColor = Color.FromArgb(32, 32, 32);
+        bouton.ForeColor = Color.Gainsboro;
+        bouton.Height = 28;
+    }
+
+    private async void FlashBouton(Control bouton)
+    {
+        var couleurInitiale = bouton.BackColor;
+        bouton.BackColor = Color.FromArgb(60, 60, 60);
+        await Task.Delay(120);
+        if (!IsDisposed)
+            bouton.BackColor = couleurInitiale;
+    }
+
+    private void NotifierAction(string message)
+    {
+        var horodatage = DateTime.Now.ToString("HH:mm:ss");
+        var ligne = $"{horodatage}  {message}";
+
+        _statutPrincipal.Text = message;
+        _statutSecondaire.Text = EstConnecte ? $"{_nomPortConnecte} @{VitesseBaud}" : "Hors ligne";
+
+        _historiqueActions.Enqueue(ligne);
+        while (_historiqueActions.Count > 5)
+            _historiqueActions.Dequeue();
+
+        _listeActions.BeginUpdate();
+        _listeActions.Items.Clear();
+        foreach (var item in _historiqueActions.Reverse())
+            _listeActions.Items.Add(item);
+        _listeActions.EndUpdate();
+    }
+
+    private void ConstruireTableauDeBord()
+    {
+        _panneauTableauDeBord.BackColor = Color.FromArgb(22, 22, 22);
+        _panneauTableauDeBord.Padding = new Padding(12);
+
+        var titre = new Label
+        {
+            Text = "TABLEAU DE BORD",
+            AutoSize = true,
+            ForeColor = Color.Gainsboro,
+            Font = new Font(Font.FontFamily, 10f, FontStyle.Bold),
+            Dock = DockStyle.Top,
+            Margin = new Padding(0, 0, 0, 10),
+            Padding = new Padding(0, 0, 0, 6),
+        };
+
+        var grille = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            ColumnCount = 2,
+            RowCount = 10,
+            BackColor = Color.FromArgb(22, 22, 22),
+        };
+        grille.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 45));
+        grille.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 55));
+
+        StyleValeur(_valPort);
+        StyleValeur(_valConnexion);
+        StyleValeur(_valX);
+        StyleValeur(_valY);
+        StyleValeur(_valYaw);
+        StyleValeur(_valDistance);
+        StyleValeur(_valMode);
+        StyleValeur(_valAgeTelemetrie);
+        StyleValeur(_valRxTx);
+
+        AjouterLigne(grille, 0, "Connexion", ConstruireLigneVoyants());
+        AjouterLigne(grille, 1, "Port", _valPort);
+        AjouterLigne(grille, 2, "État", _valConnexion);
+        AjouterLigne(grille, 3, "X (mm)", _valX);
+        AjouterLigne(grille, 4, "Y (mm)", _valY);
+        AjouterLigne(grille, 5, "Yaw (°)", _valYaw);
+        AjouterLigne(grille, 6, "Distance (mm)", _valDistance);
+        AjouterLigne(grille, 7, "Mode", _valMode);
+        AjouterLigne(grille, 8, "Âge télémétrie", _valAgeTelemetrie);
+        AjouterLigne(grille, 9, "Compteurs", _valRxTx);
+
+        _panneauTableauDeBord.Controls.Clear();
+        _panneauTableauDeBord.Controls.Add(grille);
+        _panneauTableauDeBord.Controls.Add(titre);
+    }
+
+    private Control ConstruireLigneVoyants()
+    {
+        var conteneur = new FlowLayoutPanel
+        {
+            AutoSize = true,
+            WrapContents = false,
+            BackColor = Color.FromArgb(22, 22, 22),
+            Margin = new Padding(0)
+        };
+
+        InitialiserVoyant(_voyantConnexion);
+        InitialiserVoyant(_voyantTelemetrie);
+
+        conteneur.Controls.Add(_voyantConnexion);
+        conteneur.Controls.Add(new Label { Text = "Connecté", AutoSize = true, ForeColor = Color.Silver, Padding = new Padding(6, 0, 14, 0) });
+        conteneur.Controls.Add(_voyantTelemetrie);
+        conteneur.Controls.Add(new Label { Text = "Télémétrie", AutoSize = true, ForeColor = Color.Silver, Padding = new Padding(6, 0, 0, 0) });
+
+        return conteneur;
+    }
+
+    private static void InitialiserVoyant(Panel voyant)
+    {
+        voyant.BackColor = Color.FromArgb(90, 0, 0);
+        voyant.Margin = new Padding(0, 4, 0, 0);
+        voyant.Paint += (_, e) =>
+        {
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            using var brush = new SolidBrush(voyant.BackColor);
+            e.Graphics.FillEllipse(brush, 0, 0, voyant.Width - 1, voyant.Height - 1);
+        };
+    }
+
+    private static void AjouterLigne(TableLayoutPanel grille, int ligne, string libelle, Control valeur)
+    {
+        var etiquette = new Label
+        {
+            Text = libelle,
+            AutoSize = true,
+            ForeColor = Color.Silver,
+            Padding = new Padding(0, 3, 0, 3),
+            Margin = new Padding(0, 3, 0, 3)
+        };
+        valeur.Margin = new Padding(0, 3, 0, 3);
+        grille.Controls.Add(etiquette, 0, ligne);
+        grille.Controls.Add(valeur, 1, ligne);
+    }
+
+    private static void StyleValeur(Label label)
+    {
+        label.ForeColor = Color.Gainsboro;
+        var famille = SystemFonts.MessageBoxFont?.FontFamily ?? label.Font.FontFamily;
+        label.Font = new Font(famille, 9f, FontStyle.Bold);
+    }
+
+    private void MettreAJourTableauDeBord()
+    {
+        _valPort.Text = _nomPortConnecte ?? "—";
+        _valConnexion.Text = EstConnecte ? "Connecté" : "Déconnecté";
+        _valX.Text = _positionXMm.ToString(CultureInfo.InvariantCulture);
+        _valY.Text = _positionYMm.ToString(CultureInfo.InvariantCulture);
+        _valYaw.Text = (_capCdeg / 100.0).ToString("F1", CultureInfo.InvariantCulture);
+        _valDistance.Text = _distanceMm.ToString(CultureInfo.InvariantCulture);
+        _valMode.Text = $"{_mode} ({ModeToText(_mode)})";
+        _valRxTx.Text = $"RX={_lignesRx}  TX={_lignesTx}";
+
+        if (_derniereTelemetrieA == DateTime.MinValue)
+        {
+            _valAgeTelemetrie.Text = "—";
+        }
+        else
+        {
+            var age = DateTime.Now - _derniereTelemetrieA;
+            _valAgeTelemetrie.Text = $"{age.TotalMilliseconds:0} ms";
+        }
+
+        // Voyant connexion
+        _voyantConnexion.BackColor = EstConnecte ? Color.FromArgb(0, 140, 0) : Color.FromArgb(140, 0, 0);
+
+        // Voyant télémétrie : vert si récent, orange si vieux, rouge si absent.
+        if (!EstConnecte || _derniereTelemetrieA == DateTime.MinValue)
+        {
+            _voyantTelemetrie.BackColor = Color.FromArgb(140, 0, 0);
+        }
+        else
+        {
+            var ageMs = (DateTime.Now - _derniereTelemetrieA).TotalMilliseconds;
+            _voyantTelemetrie.BackColor = ageMs < 700
+                ? Color.FromArgb(0, 140, 0)
+                : ageMs < 2000
+                    ? Color.FromArgb(170, 110, 0)
+                    : Color.FromArgb(140, 0, 0);
+        }
+
+        _voyantConnexion.Invalidate();
+        _voyantTelemetrie.Invalidate();
     }
 
     private void Journaliser(string direction, string message)
@@ -336,6 +725,8 @@ public sealed class MainForm : Form
         _derniereTelemetrieA = DateTime.MinValue;
         _labelStatut.Text = $"Connected: {portName} @{VitesseBaud} (click Stream (M))";
         Journaliser("--", $"Connected {portName} @{VitesseBaud}");
+        NotifierAction($"Connecté à {portName} @{VitesseBaud}");
+        MettreAJourTableauDeBord();
     }
 
     /// <summary>
@@ -355,6 +746,7 @@ public sealed class MainForm : Form
         _labelStatut.Text = "Disconnected";
 
         Journaliser("--", "Disconnected");
+        MettreAJourTableauDeBord();
     }
 
     /// <summary>
@@ -550,6 +942,7 @@ public sealed class MainForm : Form
 
             EnvoyerLigne($"G,{wx},{wy}\n");
             Journaliser("--", $"Goal click -> G,{wx},{wy}");
+            NotifierAction($"Objectif envoyé : x={wx} y={wy}");
 
             DemanderRafraichissementCarte();
         }, "Clic sur la carte", this, afficherDialogue: false);
@@ -624,6 +1017,7 @@ public sealed class MainForm : Form
                 _infoDerniereTouche = "| KEY=F";
                 Journaliser("KEY", "Down F -> F");
                 EnvoyerLigne("F\n");
+                NotifierAction("Commande clavier : F (avant)");
                 e.Handled = true;
                 e.SuppressKeyPress = true;
                 break;
@@ -632,6 +1026,7 @@ public sealed class MainForm : Form
                 _infoDerniereTouche = "| KEY=B";
                 Journaliser("KEY", "Down B -> B");
                 EnvoyerLigne("B\n");
+                NotifierAction("Commande clavier : B (arrière)");
                 e.Handled = true;
                 e.SuppressKeyPress = true;
                 break;
@@ -640,6 +1035,7 @@ public sealed class MainForm : Form
                 _infoDerniereTouche = "| KEY=L";
                 Journaliser("KEY", "Down L -> L");
                 EnvoyerLigne("L\n");
+                NotifierAction("Commande clavier : L (gauche)");
                 e.Handled = true;
                 e.SuppressKeyPress = true;
                 break;
@@ -648,6 +1044,7 @@ public sealed class MainForm : Form
                 _infoDerniereTouche = "| KEY=R";
                 Journaliser("KEY", "Down R -> R");
                 EnvoyerLigne("R\n");
+                NotifierAction("Commande clavier : R (droite)");
                 e.Handled = true;
                 e.SuppressKeyPress = true;
                 break;
@@ -656,6 +1053,7 @@ public sealed class MainForm : Form
                 _infoDerniereTouche = "| KEY=S";
                 Journaliser("KEY", "Down S -> S");
                 EnvoyerLigne("S\n");
+                NotifierAction("Commande clavier : S (stop)");
                 e.Handled = true;
                 e.SuppressKeyPress = true;
                 break;
@@ -666,6 +1064,7 @@ public sealed class MainForm : Form
                 _infoDerniereTouche = "| KEY=Up";
                 Journaliser("KEY", "Down Up -> F");
                 EnvoyerLigne("F\n");
+                NotifierAction("Commande clavier : ↑ -> F (avant)");
                 e.Handled = true;
                 e.SuppressKeyPress = true;
                 break;
@@ -674,6 +1073,7 @@ public sealed class MainForm : Form
                 _infoDerniereTouche = "| KEY=Down";
                 Journaliser("KEY", "Down Down -> B");
                 EnvoyerLigne("B\n");
+                NotifierAction("Commande clavier : ↓ -> B (arrière)");
                 e.Handled = true;
                 e.SuppressKeyPress = true;
                 break;
@@ -682,6 +1082,7 @@ public sealed class MainForm : Form
                 _infoDerniereTouche = "| KEY=Left";
                 Journaliser("KEY", "Down Left -> L");
                 EnvoyerLigne("L\n");
+                NotifierAction("Commande clavier : ← -> L (gauche)");
                 e.Handled = true;
                 e.SuppressKeyPress = true;
                 break;
@@ -690,6 +1091,7 @@ public sealed class MainForm : Form
                 _infoDerniereTouche = "| KEY=Right";
                 Journaliser("KEY", "Down Right -> R");
                 EnvoyerLigne("R\n");
+                NotifierAction("Commande clavier : → -> R (droite)");
                 e.Handled = true;
                 e.SuppressKeyPress = true;
                 break;
@@ -700,6 +1102,7 @@ public sealed class MainForm : Form
                 _infoDerniereTouche = "| KEY=P";
                 Journaliser("KEY", "Down P -> P (ping)");
                 EnvoyerLigne("P\n");
+                NotifierAction("Commande clavier : P (ping)");
                 e.Handled = true;
                 e.SuppressKeyPress = true;
                 break;
@@ -729,6 +1132,7 @@ public sealed class MainForm : Form
                 _infoDerniereTouche = "| KEY=UP";
                 Journaliser("KEY", $"Up {e.KeyCode} -> S");
                 EnvoyerLigne("S\n");
+                NotifierAction("Commande clavier : relâché -> S (stop)");
                 e.Handled = true;
                 e.SuppressKeyPress = true;
                 break;

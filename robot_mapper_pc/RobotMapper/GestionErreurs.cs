@@ -4,6 +4,7 @@ using System.IO;
 using System.Text;
 using System.Threading;
 using System.Windows.Forms;
+using System.Diagnostics;
 
 namespace RobotMapper;
 
@@ -48,6 +49,17 @@ internal static class GestionErreurs
         {
             var cheminLog = EcrireLog(exception, contexte);
 
+            // Sortie diagnostic (utile en dev / capture via DebugView).
+            try
+            {
+                Debug.WriteLine($"[RobotMapper] {contexte}: {exception}");
+                Trace.WriteLine($"[RobotMapper] {contexte}: {exception}");
+            }
+            catch
+            {
+                // Ignore
+            }
+
             if (!afficherDialogue)
                 return;
 
@@ -55,7 +67,20 @@ internal static class GestionErreurs
             message.AppendLine("Une erreur est survenue.");
             message.AppendLine();
             message.AppendLine($"Contexte : {contexte}");
+            message.AppendLine($"Type : {exception.GetType().FullName}");
             message.AppendLine($"Détails : {exception.Message}");
+            if (!string.IsNullOrWhiteSpace(exception.StackTrace))
+            {
+                message.AppendLine();
+                message.AppendLine("Pile (extrait) :");
+
+                var lignes = exception.StackTrace
+                    .Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries);
+
+                // On affiche seulement les premières lignes, le reste est dans le fichier log.
+                for (var i = 0; i < Math.Min(8, lignes.Length); i++)
+                    message.AppendLine(lignes[i]);
+            }
             message.AppendLine();
             message.AppendLine("Un fichier de log a été créé :");
             message.AppendLine(cheminLog);
