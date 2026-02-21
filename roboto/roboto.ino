@@ -349,6 +349,15 @@ static inline void handleCommand(char c) {
 	}
 }
 
+static void stopAll() {
+	mode = MODE_MANUAL;
+	hasGoal = false;
+	avoiding = false;
+	avoidUntilMs = 0;
+	streamEnabled = false;
+	setMotion('S');
+}
+
 static bool parseInt32(const char *s, int32_t *out) {
 	char *endPtr = nullptr;
 	long v = strtol(s, &endPtr, 10);
@@ -365,6 +374,13 @@ static void processLine(char *line) {
 	// Commande = premier caractere (fonctionne aussi pour les commandes avec virgules)
 	char cmd = line[0];
 
+	// X = arrêt global : retour état d'attente (manuel + stop + stream off + reset auto)
+	if (cmd == 'X' || cmd == 'x') {
+		stopAll();
+		bt.print(F("OK,X\n"));
+		return;
+	}
+
 	// Legacy manual commands
 	if (cmd == 'F' || cmd == 'f' || cmd == 'B' || cmd == 'b' || cmd == 'S' || cmd == 's' || cmd == 'L' || cmd == 'l' || cmd == 'R' || cmd == 'r') {
 		handleCommand(cmd);
@@ -373,6 +389,30 @@ static void processLine(char *line) {
 
 	// A = toggle auto explore
 	if (cmd == 'A' || cmd == 'a') {
+		// Optionnel : A,0 / A,1 pour forcer un état (évite les désync côté PC)
+		char *comma = strchr(line, ',');
+		if (comma) {
+			int32_t v;
+			if (!parseInt32(comma + 1, &v)) return;
+			if (v <= 0) {
+				mode = MODE_MANUAL;
+				hasGoal = false;
+				avoiding = false;
+				avoidUntilMs = 0;
+				setMotion('S');
+			} else {
+				mode = MODE_AUTO_EXPLORE;
+				hasGoal = false;
+				avoiding = false;
+				avoidUntilMs = 0;
+				setMotion('F');
+			}
+			bt.print(F("OK,A,"));
+			bt.print(mode == MODE_AUTO_EXPLORE ? 1 : 0);
+			bt.print('\n');
+			return;
+		}
+
 		if (mode == MODE_AUTO_EXPLORE) {
 			mode = MODE_MANUAL;
 			avoiding = false;
@@ -392,6 +432,18 @@ static void processLine(char *line) {
 
 	// M = toggle streaming telemetry
 	if (cmd == 'M' || cmd == 'm') {
+		// Optionnel : M,0 / M,1 pour forcer un état (évite les désync côté PC)
+		char *comma = strchr(line, ',');
+		if (comma) {
+			int32_t v;
+			if (!parseInt32(comma + 1, &v)) return;
+			streamEnabled = (v > 0);
+			bt.print(F("OK,M,"));
+			bt.print(streamEnabled ? 1 : 0);
+			bt.print('\n');
+			return;
+		}
+
 		streamEnabled = !streamEnabled;
 		bt.print(F("OK,M,"));
 		bt.print(streamEnabled ? 1 : 0);
@@ -543,7 +595,7 @@ void setup() {
 }
 
 void loop() {
-	static char lastCmd = '\0';
+	static char lastMotionCmd = 'S';
 	static char lineBuf[64];
 	static uint8_t lineLen = 0;
 
@@ -585,9 +637,12 @@ void loop() {
 			continue;
 		}
 
+
 		// Beaucoup d'apps envoient la meme lettre en continu pendant l'appui.
-		// Re-appliquer la meme commande ne change rien, donc on ignore les doublons.
-		if (c == lastCmd) {
+		// On ne filtre les doublons QUE pour les commandes de mouvement.
+		// Important : ne pas filtrer A/M (toggle), sinon on ne peut plus les stopper.
+		char cu = (char)toupper((unsigned char)c);
+		if ((cu == 'F' || cu == 'B' || cu == 'S' || cu == 'L' || cu == 'R') && cu == lastMotionCmd) {
 			continue;
 		}
 
@@ -601,7 +656,8 @@ void loop() {
 			lineBuf[1] = 0;
 			processLine(lineBuf);
 			lineLen = 0;
-			lastCmd = c;
+			if (cu == 'F' || cu == 'B' || cu == 'S' || cu == 'L' || cu == 'R')
+				lastMotionCmd = cu;
 		}
 	}
 }

@@ -33,6 +33,7 @@ public sealed class MainForm : Form
     private readonly Button _boutonDeconnecter = new() { Text = "Disconnect", Width = 80, Enabled = false };
     private readonly Button _boutonStream = new() { Text = "Stream (M)", Width = 100, Enabled = false };
     private readonly Button _boutonAuto = new() { Text = "Auto (A)", Width = 90, Enabled = false };
+    private readonly Button _boutonStop = new() { Text = "Stop (Esc)", Width = 100, Enabled = false };
     private readonly Button _boutonPing = new() { Text = "Ping (P)", Width = 90, Enabled = false };
     private readonly Label _labelStatut = new() { AutoSize = true, Text = "Disconnected" };
     private readonly DoubleBufferedPanel _panneauCarte = new() { Dock = DockStyle.Fill, BackColor = Color.Black };
@@ -56,6 +57,9 @@ public sealed class MainForm : Form
     private int _objectifXMm;
     private int _objectifYMm;
     private bool _rafraichissementEnAttente;
+
+    private bool _streamActif;
+    private bool _autoActif;
 
     private string _infoDerniereTouche = "";
 
@@ -131,6 +135,7 @@ public sealed class MainForm : Form
         AppliquerStyleBouton(_boutonDeconnecter);
         AppliquerStyleBouton(_boutonStream);
         AppliquerStyleBouton(_boutonAuto);
+        AppliquerStyleBouton(_boutonStop);
         AppliquerStyleBouton(_boutonPing);
 
         _comboPortsCom.BackColor = Color.FromArgb(30, 30, 30);
@@ -167,6 +172,7 @@ public sealed class MainForm : Form
         barreHaut.Controls.Add(Espace(10));
         barreHaut.Controls.Add(_boutonStream);
         barreHaut.Controls.Add(_boutonAuto);
+        barreHaut.Controls.Add(_boutonStop);
         barreHaut.Controls.Add(_boutonPing);
         barreHaut.Controls.Add(Espace(12));
         _labelStatut.ForeColor = Color.Silver;
@@ -254,17 +260,22 @@ public sealed class MainForm : Form
             GestionErreurs.Executer(() =>
             {
                 FlashBouton(_boutonStream);
-                EnvoyerLigne("M\n");
-                NotifierAction("Commande envoyée : M (stream)");
+                BasculerStream();
             }, "Commande Stream (M)", this, afficherDialogue: false);
 
         _boutonAuto.Click += (_, _) =>
             GestionErreurs.Executer(() =>
             {
                 FlashBouton(_boutonAuto);
-                EnvoyerLigne("A\n");
-                NotifierAction("Commande envoyée : A (auto)");
+                BasculerAuto();
             }, "Commande Auto (A)", this, afficherDialogue: false);
+
+        _boutonStop.Click += (_, _) =>
+            GestionErreurs.Executer(() =>
+            {
+                FlashBouton(_boutonStop);
+                ArreterTout("Bouton Stop");
+            }, "Arrêt des actions", this, afficherDialogue: false);
 
         _boutonPing.Click += (_, _) =>
             GestionErreurs.Executer(() =>
@@ -560,7 +571,58 @@ public sealed class MainForm : Form
         _boutonDeconnecter.Enabled = estConnecte;
         _boutonStream.Enabled = estConnecte;
         _boutonAuto.Enabled = estConnecte;
+        _boutonStop.Enabled = estConnecte;
         _boutonPing.Enabled = estConnecte;
+
+        if (!estConnecte)
+        {
+            _streamActif = false;
+            _autoActif = false;
+            MettreAJourLibellesActions();
+        }
+    }
+
+    private void MettreAJourLibellesActions()
+    {
+        _boutonStream.Text = _streamActif ? "Stop Stream (M)" : "Stream (M)";
+        _boutonAuto.Text = _autoActif ? "Stop Auto (A)" : "Auto (A)";
+    }
+
+    private void BasculerStream()
+    {
+        if (!EstConnecte)
+            return;
+
+        var activer = !_streamActif;
+        EnvoyerLigne(activer ? "M,1\n" : "M,0\n");
+        _streamActif = activer;
+        MettreAJourLibellesActions();
+        NotifierAction(_streamActif ? "Stream activé" : "Stream stoppé");
+    }
+
+    private void BasculerAuto()
+    {
+        if (!EstConnecte)
+            return;
+
+        var activer = !_autoActif;
+        EnvoyerLigne(activer ? "A,1\n" : "A,0\n");
+        _autoActif = activer;
+        MettreAJourLibellesActions();
+        NotifierAction(_autoActif ? "Mode auto activé" : "Mode auto stoppé");
+    }
+
+    private void ArreterTout(string origine)
+    {
+        if (!EstConnecte)
+            return;
+
+        // Commande explicite côté firmware : stop tout (manuel + stop + stream off + reset auto/goal).
+        EnvoyerLigne("X\n");
+        _autoActif = false;
+        _streamActif = false;
+        MettreAJourLibellesActions();
+        NotifierAction($"Arrêt demandé ({origine}) : retour en attente");
     }
 
     private void DemanderRafraichissementCarte()
@@ -704,6 +766,37 @@ public sealed class MainForm : Form
         line = line.Trim();
         if (line.Length == 0) return;
 
+        // Synchronisation UI avec les accusés firmware.
+        // Format attendu : OK,M,0|1  /  OK,A,0|1  / OK,X
+        if (line.StartsWith("OK,", StringComparison.OrdinalIgnoreCase))
+        {
+            var parts = line.Split(',');
+            if (parts.Length >= 2)
+            {
+                var cmd = parts[1].Trim().ToUpperInvariant();
+                if (cmd == "M" && parts.Length >= 3 && int.TryParse(parts[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out var m))
+                {
+                    _streamActif = m != 0;
+                    MettreAJourLibellesActions();
+                }
+                else if (cmd == "A" && parts.Length >= 3 && int.TryParse(parts[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out var a))
+                {
+                    _autoActif = a != 0;
+                    MettreAJourLibellesActions();
+                }
+                else if (cmd == "X")
+                {
+                    _autoActif = false;
+                    _streamActif = false;
+                    MettreAJourLibellesActions();
+                }
+            }
+
+            Journaliser("RX", line);
+            MettreAJourTableauDeBord();
+            return;
+        }
+
         Journaliser("RX", line);
 
         var changements = _core.TraiterLigne(line);
@@ -817,6 +910,14 @@ public sealed class MainForm : Form
 
     private void MainFormOnKeyDown(object? sender, KeyEventArgs e)
     {
+        if (e.KeyCode == Keys.Escape)
+        {
+            ArreterTout("Touche Esc");
+            e.Handled = true;
+            e.SuppressKeyPress = true;
+            return;
+        }
+
         if (!EstConnecte)
             return;
 
@@ -918,6 +1019,24 @@ public sealed class MainForm : Form
                 Journaliser("KEY", "Down P -> P (ping)");
                 EnvoyerLigne("P\n");
                 NotifierAction("Commande clavier : P (ping)");
+                e.Handled = true;
+                e.SuppressKeyPress = true;
+                break;
+
+            // Stream/Auto clavier : toggle
+            case Keys.M:
+                _touchesEnfoncees.Add(e.KeyCode);
+                _infoDerniereTouche = "| KEY=M";
+                Journaliser("KEY", "Down M -> toggle stream");
+                BasculerStream();
+                e.Handled = true;
+                e.SuppressKeyPress = true;
+                break;
+            case Keys.A:
+                _touchesEnfoncees.Add(e.KeyCode);
+                _infoDerniereTouche = "| KEY=A";
+                Journaliser("KEY", "Down A -> toggle auto");
+                BasculerAuto();
                 e.Handled = true;
                 e.SuppressKeyPress = true;
                 break;
