@@ -3,11 +3,12 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Globalization;
-using System.IO.Ports;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using RobotMapper.Core;
+using RobotMapper.Services;
 
 namespace RobotMapper;
 
@@ -22,8 +23,6 @@ namespace RobotMapper;
 public sealed class MainForm : Form
 {
     private const int VitesseBaud = 9600;
-    private const int TimeoutLectureMs = 500;
-    private const int TimeoutEcritureMs = 500;
     private const int IntervalleRafraichissementUiMs = 50;
     private const int LignesLogMax = 650;
     private const int LignesLogConservees = 600;
@@ -47,34 +46,17 @@ public sealed class MainForm : Form
         Font = new Font("Consolas", 9f),
     };
 
-    private SerialPort? _portSerie;
-    private string? _nomPortConnecte;
+    private readonly RobotMapperCore _core = new();
+    private readonly PortSerieService _portSerieService = new(VitesseBaud);
 
-    private readonly object _verrouReception = new();
-    private readonly StringBuilder _tamponReception = new();
+    private readonly Bitmap _bitmapGrille = new(CarteOccupation.Largeur, CarteOccupation.Hauteur);
 
-    // Carte d'occupation (grille)
-    private const int GridW = 201;
-    private const int GridH = 201;
-    private const int CellSizeMm = 50; // 5cm
-    private readonly sbyte[,] _grille = new sbyte[GridW, GridH]; // -1 inconnu, 0 libre, 1 occupé
-    private readonly Bitmap _bitmapGrille = new(GridW, GridH);
-
-    // État télémétrie (dernières valeurs reçues)
-    private int _positionXMm;
-    private int _positionYMm;
-    private int _capCdeg;
-    private int _distanceMm;
-    private int _mode;
+    // Objectif envoyé au robot (affichage)
     private bool _objectifDefini;
     private int _objectifXMm;
     private int _objectifYMm;
-
-    private int _lignesRx;
-    private int _lignesTx;
     private bool _rafraichissementEnAttente;
 
-    private DateTime _derniereTelemetrieA = DateTime.MinValue;
     private string _infoDerniereTouche = "";
 
     private readonly HashSet<Keys> _touchesEnfoncees = new();
@@ -102,7 +84,7 @@ public sealed class MainForm : Form
     private readonly Label _valAgeTelemetrie = new() { AutoSize = true };
     private readonly Label _valRxTx = new() { AutoSize = true };
 
-    private bool EstConnecte => _portSerie is not null && _portSerie.IsOpen;
+    private bool EstConnecte => _portSerieService.EstConnecte;
 
     public MainForm()
     {
@@ -113,12 +95,32 @@ public sealed class MainForm : Form
         KeyPreview = true;
         DoubleBuffered = true;
 
-        // Initialisation de la carte : tout est inconnu au départ.
-        for (int x = 0; x < GridW; x++)
-        for (int y = 0; y < GridH; y++)
-            _grille[x, y] = -1;
-
         InitialiserBitmap();
+
+        // Liaison service série -> UI
+        _portSerieService.ConnexionChangee += (_, connecte) =>
+            BeginInvoke(new Action(() =>
+            {
+                MettreAJourEtatConnexion(connecte);
+                MettreAJourTableauDeBord();
+            }));
+
+        _portSerieService.ErreurSurvenue += (_, ex) =>
+            BeginInvoke(new Action(() => GestionErreurs.Signaler(ex, "Port série", this, afficherDialogue: false)));
+
+        _portSerieService.LigneRecue += (_, ligne) =>
+        {
+            if (IsDisposed)
+                return;
+
+            if (InvokeRequired)
+            {
+                BeginInvoke(new Action(() => TraiterLigneRecue(ligne)));
+                return;
+            }
+
+            TraiterLigneRecue(ligne);
+        };
 
         // Style “cockpit” (sobre) : fond sombre + contrôles plats.
         BackColor = Color.FromArgb(18, 18, 18);
@@ -366,7 +368,7 @@ public sealed class MainForm : Form
         var ligne = $"{horodatage}  {message}";
 
         _statutPrincipal.Text = message;
-        _statutSecondaire.Text = EstConnecte ? $"{_nomPortConnecte} @{VitesseBaud}" : "Hors ligne";
+        _statutSecondaire.Text = EstConnecte ? $"{_portSerieService.NomPortConnecte} @{VitesseBaud}" : "Hors ligne";
 
         _historiqueActions.Enqueue(ligne);
         while (_historiqueActions.Count > 5)
@@ -489,22 +491,22 @@ public sealed class MainForm : Form
 
     private void MettreAJourTableauDeBord()
     {
-        _valPort.Text = _nomPortConnecte ?? "—";
+        _valPort.Text = _portSerieService.NomPortConnecte ?? "—";
         _valConnexion.Text = EstConnecte ? "Connecté" : "Déconnecté";
-        _valX.Text = _positionXMm.ToString(CultureInfo.InvariantCulture);
-        _valY.Text = _positionYMm.ToString(CultureInfo.InvariantCulture);
-        _valYaw.Text = (_capCdeg / 100.0).ToString("F1", CultureInfo.InvariantCulture);
-        _valDistance.Text = _distanceMm.ToString(CultureInfo.InvariantCulture);
-        _valMode.Text = $"{_mode} ({ModeToText(_mode)})";
-        _valRxTx.Text = $"RX={_lignesRx}  TX={_lignesTx}";
+        _valX.Text = _core.Etat.PositionXMm.ToString(CultureInfo.InvariantCulture);
+        _valY.Text = _core.Etat.PositionYMm.ToString(CultureInfo.InvariantCulture);
+        _valYaw.Text = (_core.Etat.CapCdeg / 100.0).ToString("F1", CultureInfo.InvariantCulture);
+        _valDistance.Text = _core.Etat.DistanceMm.ToString(CultureInfo.InvariantCulture);
+        _valMode.Text = $"{_core.Etat.Mode} ({ModeToText(_core.Etat.Mode)})";
+        _valRxTx.Text = $"RX={_portSerieService.LignesRx}  TX={_portSerieService.LignesTx}";
 
-        if (_derniereTelemetrieA == DateTime.MinValue)
+        if (_core.Etat.DerniereTelemetrieA == DateTime.MinValue)
         {
             _valAgeTelemetrie.Text = "—";
         }
         else
         {
-            var age = DateTime.Now - _derniereTelemetrieA;
+            var age = DateTime.Now - _core.Etat.DerniereTelemetrieA;
             _valAgeTelemetrie.Text = $"{age.TotalMilliseconds:0} ms";
         }
 
@@ -512,13 +514,13 @@ public sealed class MainForm : Form
         _voyantConnexion.BackColor = EstConnecte ? Color.FromArgb(0, 140, 0) : Color.FromArgb(140, 0, 0);
 
         // Voyant télémétrie : vert si récent, orange si vieux, rouge si absent.
-        if (!EstConnecte || _derniereTelemetrieA == DateTime.MinValue)
+        if (!EstConnecte || _core.Etat.DerniereTelemetrieA == DateTime.MinValue)
         {
             _voyantTelemetrie.BackColor = Color.FromArgb(140, 0, 0);
         }
         else
         {
-            var ageMs = (DateTime.Now - _derniereTelemetrieA).TotalMilliseconds;
+            var ageMs = (DateTime.Now - _core.Etat.DerniereTelemetrieA).TotalMilliseconds;
             _voyantTelemetrie.BackColor = ageMs < 700
                 ? Color.FromArgb(0, 140, 0)
                 : ageMs < 2000
@@ -582,27 +584,29 @@ public sealed class MainForm : Form
         if (!EstConnecte)
             return;
 
-        var modeText = ModeToText(_mode);
+        var mode = _core.Etat.Mode;
+        var modeText = ModeToText(mode);
 
         string ageText;
-        if (_derniereTelemetrieA == DateTime.MinValue)
+        if (_core.Etat.DerniereTelemetrieA == DateTime.MinValue)
         {
             ageText = "No telemetry (click Stream (M))";
         }
         else
         {
-            var age = DateTime.Now - _derniereTelemetrieA;
+            var age = DateTime.Now - _core.Etat.DerniereTelemetrieA;
             ageText = $"Last T={age.TotalMilliseconds:0}ms ago";
         }
 
-        _labelStatut.Text = $"{_nomPortConnecte} @{VitesseBaud} | x={_positionXMm} y={_positionYMm} yaw={_capCdeg / 100.0:F1}° dist={_distanceMm} mode={_mode}({modeText}) | {ageText} | RX={_lignesRx} TX={_lignesTx} {_infoDerniereTouche}";
+        _labelStatut.Text = $"{_portSerieService.NomPortConnecte} @{VitesseBaud} | x={_core.Etat.PositionXMm} y={_core.Etat.PositionYMm} yaw={_core.Etat.CapCdeg / 100.0:F1}° dist={_core.Etat.DistanceMm} mode={mode}({modeText}) | {ageText} | RX={_portSerieService.LignesRx} TX={_portSerieService.LignesTx} {_infoDerniereTouche}";
     }
 
     private void InitialiserBitmap()
     {
-        for (int x = 0; x < GridW; x++)
-        for (int y = 0; y < GridH; y++)
-            _bitmapGrille.SetPixel(x, y, Color.FromArgb(40, 40, 40));
+        var grille = _core.Carte.Grille;
+        for (int x = 0; x < CarteOccupation.Largeur; x++)
+        for (int y = 0; y < CarteOccupation.Hauteur; y++)
+            _bitmapGrille.SetPixel(x, y, ColorForCell(grille[x, y]));
     }
 
     /// <summary>
@@ -610,7 +614,7 @@ public sealed class MainForm : Form
     /// </summary>
     private void RafraichirListePorts()
     {
-        var ports = SerialPort.GetPortNames().OrderBy(p => p).ToArray();
+        var ports = PortSerieService.ListerPorts();
         _comboPortsCom.Items.Clear();
         _comboPortsCom.Items.AddRange(ports);
         if (ports.Length > 0)
@@ -625,74 +629,12 @@ public sealed class MainForm : Form
         if (_comboPortsCom.SelectedItem is not string portName)
             return;
 
-        Deconnecter();
-
-        _portSerie = new SerialPort(portName, VitesseBaud)
-        {
-            NewLine = "\n",
-            Encoding = Encoding.ASCII,
-            ReadTimeout = TimeoutLectureMs,
-            WriteTimeout = TimeoutEcritureMs
-        };
-
-        _portSerie.DataReceived += (_, _) =>
-        {
-            try
-            {
-                if (_portSerie is null) return;
-
-                var chunk = _portSerie.ReadExisting();
-                if (string.IsNullOrEmpty(chunk))
-                    return;
-
-                List<string> lines = new();
-
-                lock (_verrouReception)
-                {
-                    _tamponReception.Append(chunk);
-
-                    while (true)
-                    {
-                        var s = _tamponReception.ToString();
-                        var idx = s.IndexOf('\n');
-                        if (idx < 0)
-                            break;
-
-                        var line = s.Substring(0, idx);
-                        // drop consumed + '\n'
-                        _tamponReception.Clear();
-                        _tamponReception.Append(s.Substring(idx + 1));
-
-                        line = line.Trim('\r');
-                        if (line.Length > 0)
-                            lines.Add(line);
-                    }
-                }
-
-                if (lines.Count > 0)
-                {
-                    BeginInvoke(new Action(() =>
-                    {
-                        foreach (var line in lines)
-                            TraiterLigneRecue(line);
-                    }));
-                }
-            }
-            catch (Exception ex)
-            {
-                // Ne pas faire crasher l'application sur une erreur de lecture (câble, BT instable, etc.).
-                GestionErreurs.Signaler(ex, "Lecture port série (DataReceived)", this, afficherDialogue: false);
-            }
-        };
-
         try
         {
-            _portSerie.Open();
+            _portSerieService.Connecter(portName);
         }
         catch (UnauthorizedAccessException)
         {
-            _portSerie.Dispose();
-            _portSerie = null;
             _labelStatut.Text = $"Cannot open {portName}";
             MessageBox.Show(
                 this,
@@ -713,16 +655,11 @@ public sealed class MainForm : Form
         }
         catch (Exception ex)
         {
-            _portSerie.Dispose();
-            _portSerie = null;
             _labelStatut.Text = $"Cannot open {portName}";
             GestionErreurs.Signaler(ex, $"Erreur ouverture port {portName}", this, afficherDialogue: true);
             return;
         }
 
-        MettreAJourEtatConnexion(true);
-        _nomPortConnecte = portName;
-        _derniereTelemetrieA = DateTime.MinValue;
         _labelStatut.Text = $"Connected: {portName} @{VitesseBaud} (click Stream (M))";
         Journaliser("--", $"Connected {portName} @{VitesseBaud}");
         NotifierAction($"Connecté à {portName} @{VitesseBaud}");
@@ -734,15 +671,7 @@ public sealed class MainForm : Form
     /// </summary>
     private void Deconnecter()
     {
-        if (_portSerie is not null)
-        {
-            try { _portSerie.Close(); } catch { /* ignore */ }
-            try { _portSerie.Dispose(); } catch { /* ignore */ }
-        }
-
-        _portSerie = null;
-        _nomPortConnecte = null;
-        MettreAJourEtatConnexion(false);
+        _portSerieService.Deconnecter();
         _labelStatut.Text = "Disconnected";
 
         Journaliser("--", "Disconnected");
@@ -756,8 +685,7 @@ public sealed class MainForm : Form
     {
         try
         {
-            _portSerie?.Write(s);
-            _lignesTx++;
+            _portSerieService.Envoyer(s);
             Journaliser("TX", s.Trim());
             MettreAJourTexteStatut();
         }
@@ -776,60 +704,23 @@ public sealed class MainForm : Form
         line = line.Trim();
         if (line.Length == 0) return;
 
-        _lignesRx++;
         Journaliser("RX", line);
 
-        // T,<ms>,<x_mm>,<y_mm>,<yaw_cdeg>,<dist_mm>,<mode>
-        if (line.StartsWith("T,"))
-        {
-            var parts = line.Split(',');
-            if (parts.Length < 7) return;
+        var changements = _core.TraiterLigne(line);
+        AppliquerChangementsCarte(changements);
 
-            if (!int.TryParse(parts[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out _positionXMm)) return;
-            if (!int.TryParse(parts[3], NumberStyles.Integer, CultureInfo.InvariantCulture, out _positionYMm)) return;
-            if (!int.TryParse(parts[4], NumberStyles.Integer, CultureInfo.InvariantCulture, out _capCdeg)) return;
-            if (!int.TryParse(parts[5], NumberStyles.Integer, CultureInfo.InvariantCulture, out _distanceMm)) return;
-            if (!int.TryParse(parts[6], NumberStyles.Integer, CultureInfo.InvariantCulture, out _mode)) return;
-
-            if (_distanceMm > 0)
-                MettreAJourCarteAvecMesure(_positionXMm, _positionYMm, _capCdeg, _distanceMm);
-
-            _derniereTelemetrieA = DateTime.Now;
-            Journaliser("T", $"x={_positionXMm} y={_positionYMm} yaw={_capCdeg / 100.0:F1}° dist={_distanceMm} mode={_mode}({ModeToText(_mode)})");
-            MettreAJourTexteStatut();
-            DemanderRafraichissementCarte();
-            return;
-        }
-
-        // D,<dist_mm>
-        if (line.StartsWith("D,"))
-        {
-            var parts = line.Split(',');
-            if (parts.Length >= 2 && int.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var d))
-            {
-                _distanceMm = d;
-                Journaliser("D", $"dist={_distanceMm}mm");
-            }
-            MettreAJourTexteStatut();
-            DemanderRafraichissementCarte();
-        }
+        MettreAJourTexteStatut();
+        MettreAJourTableauDeBord();
+        DemanderRafraichissementCarte();
     }
 
-    /// <summary>
-    /// Met à jour la carte à partir d'une mesure distance (télémètre) depuis la pose courante.
-    /// Trace un rayon de cellules libres et marque la cellule d'impact comme occupée.
-    /// </summary>
-    private void MettreAJourCarteAvecMesure(int xMm, int yMm, int yawCdeg, int distMm)
+    private void AppliquerChangementsCarte(List<CelluleChangee> changements)
     {
-        // endpoint in world
-        var yawRad = (yawCdeg / 100.0) * (Math.PI / 180.0);
-        var ex = xMm + (int)(distMm * Math.Cos(yawRad));
-        var ey = yMm + (int)(distMm * Math.Sin(yawRad));
+        if (changements.Count == 0)
+            return;
 
-        var (sx, sy) = MondeVersGrille(xMm, yMm);
-        var (gx, gy) = MondeVersGrille(ex, ey);
-
-        TracerRayon(sx, sy, gx, gy);
+        foreach (var c in changements)
+            _bitmapGrille.SetPixel(c.Gx, c.Gy, ColorForCell(c.Valeur));
     }
 
     private static int Clamp(int v, int min, int max) => v < min ? min : (v > max ? max : v);
@@ -844,83 +735,6 @@ public sealed class MainForm : Form
         };
     }
 
-    /// <summary>
-    /// Convertit des coordonnées monde (mm) en indices de grille.
-    /// Convention : l'origine (0,0) est au centre de la grille.
-    /// </summary>
-    private (int gx, int gy) MondeVersGrille(int xMm, int yMm)
-    {
-        var cx = GridW / 2;
-        var cy = GridH / 2;
-        var gx = cx + (int)Math.Round(xMm / (double)CellSizeMm);
-        var gy = cy - (int)Math.Round(yMm / (double)CellSizeMm);
-        gx = Clamp(gx, 0, GridW - 1);
-        gy = Clamp(gy, 0, GridH - 1);
-        return (gx, gy);
-    }
-
-    /// <summary>
-    /// Convertit un index de grille en coordonnées monde (mm).
-    /// </summary>
-    private (int xMm, int yMm) GrilleVersMonde(int gx, int gy)
-    {
-        var cx = GridW / 2;
-        var cy = GridH / 2;
-        var xMm = (gx - cx) * CellSizeMm;
-        var yMm = (cy - gy) * CellSizeMm;
-        return (xMm, yMm);
-    }
-
-    private void DefinirCellule(int gx, int gy, sbyte value)
-    {
-        if (gx < 0 || gy < 0 || gx >= GridW || gy >= GridH) return;
-
-        if (value == 0 && _grille[gx, gy] == 1)
-            return; // ne pas effacer un obstacle par "free"
-
-        _grille[gx, gy] = value;
-        _bitmapGrille.SetPixel(gx, gy, ColorForCell(value));
-    }
-
-    private void TracerRayon(int x0, int y0, int x1, int y1)
-    {
-        // Bresenham
-        int dx = Math.Abs(x1 - x0);
-        int sx = x0 < x1 ? 1 : -1;
-        int dy = -Math.Abs(y1 - y0);
-        int sy = y0 < y1 ? 1 : -1;
-        int err = dx + dy;
-
-        int x = x0;
-        int y = y0;
-
-        // mark free along the ray, occupied at end
-        while (true)
-        {
-            if (x == x1 && y == y1)
-                break;
-
-            DefinirCellule(x, y, 0);
-
-            int e2 = 2 * err;
-            if (e2 >= dy)
-            {
-                err += dy;
-                x += sx;
-            }
-            if (e2 <= dx)
-            {
-                err += dx;
-                y += sy;
-            }
-
-            if (x < 0 || y < 0 || x >= GridW || y >= GridH)
-                break;
-        }
-
-        DefinirCellule(x1, y1, 1);
-    }
-
     private void PanneauCarteOnMouseClick(object? sender, MouseEventArgs e)
     {
         GestionErreurs.Executer(() =>
@@ -930,12 +744,12 @@ public sealed class MainForm : Form
             if (panelRect.Width <= 0 || panelRect.Height <= 0) return;
 
         // Map is drawn stretched to panel
-            var gx = (int)Math.Round(e.X / (double)panelRect.Width * (GridW - 1));
-            var gy = (int)Math.Round(e.Y / (double)panelRect.Height * (GridH - 1));
-            gx = Clamp(gx, 0, GridW - 1);
-            gy = Clamp(gy, 0, GridH - 1);
+            var gx = (int)Math.Round(e.X / (double)panelRect.Width * (CarteOccupation.Largeur - 1));
+            var gy = (int)Math.Round(e.Y / (double)panelRect.Height * (CarteOccupation.Hauteur - 1));
+            gx = Clamp(gx, 0, CarteOccupation.Largeur - 1);
+            gy = Clamp(gy, 0, CarteOccupation.Hauteur - 1);
 
-            var (wx, wy) = GrilleVersMonde(gx, gy);
+            var (wx, wy) = _core.Carte.GrilleVersMonde(gx, gy);
             _objectifXMm = wx;
             _objectifYMm = wy;
             _objectifDefini = true;
@@ -963,15 +777,15 @@ public sealed class MainForm : Form
             e.Graphics.DrawImage(_bitmapGrille, dst);
 
             // Dessin de la pose robot
-            var (rx, ry) = MondeVersGrille(_positionXMm, _positionYMm);
-            var px = dst.Left + (int)Math.Round(rx / (double)(GridW - 1) * dst.Width);
-            var py = dst.Top + (int)Math.Round(ry / (double)(GridH - 1) * dst.Height);
+            var (rx, ry) = _core.Carte.MondeVersGrille(_core.Etat.PositionXMm, _core.Etat.PositionYMm);
+            var px = dst.Left + (int)Math.Round(rx / (double)(CarteOccupation.Largeur - 1) * dst.Width);
+            var py = dst.Top + (int)Math.Round(ry / (double)(CarteOccupation.Hauteur - 1) * dst.Height);
 
             using var robotBrush = new SolidBrush(Color.Red);
             e.Graphics.FillEllipse(robotBrush, px - 4, py - 4, 8, 8);
 
             // Trait d'orientation
-            var yawRad = (_capCdeg / 100.0) * (Math.PI / 180.0);
+            var yawRad = (_core.Etat.CapCdeg / 100.0) * (Math.PI / 180.0);
             var hx = px + (int)(18 * Math.Cos(yawRad));
             var hy = py - (int)(18 * Math.Sin(yawRad));
             using var pen = new Pen(Color.Red, 2);
@@ -980,9 +794,9 @@ public sealed class MainForm : Form
             // Objectif (croix verte)
             if (_objectifDefini)
             {
-                var (gx, gy) = MondeVersGrille(_objectifXMm, _objectifYMm);
-                var gpx = dst.Left + (int)Math.Round(gx / (double)(GridW - 1) * dst.Width);
-                var gpy = dst.Top + (int)Math.Round(gy / (double)(GridH - 1) * dst.Height);
+                var (gx, gy) = _core.Carte.MondeVersGrille(_objectifXMm, _objectifYMm);
+                var gpx = dst.Left + (int)Math.Round(gx / (double)(CarteOccupation.Largeur - 1) * dst.Width);
+                var gpy = dst.Top + (int)Math.Round(gy / (double)(CarteOccupation.Hauteur - 1) * dst.Height);
                 using var gpen = new Pen(Color.Lime, 2);
                 e.Graphics.DrawLine(gpen, gpx - 6, gpy, gpx + 6, gpy);
                 e.Graphics.DrawLine(gpen, gpx, gpy - 6, gpx, gpy + 6);
@@ -990,19 +804,20 @@ public sealed class MainForm : Form
 
             // Indicateur de mode
             using var modeBrush = new SolidBrush(Color.Yellow);
-            e.Graphics.DrawString($"Mode={_mode}", Font, modeBrush, 8, 8);
+            e.Graphics.DrawString($"Mode={_core.Etat.Mode}", Font, modeBrush, 8, 8);
         }, "Dessin de la carte", this, afficherDialogue: false);
     }
 
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
         Deconnecter();
+        _portSerieService.Dispose();
         base.OnFormClosed(e);
     }
 
     private void MainFormOnKeyDown(object? sender, KeyEventArgs e)
     {
-        if (_portSerie is null || !_portSerie.IsOpen)
+        if (!EstConnecte)
             return;
 
         if (_touchesEnfoncees.Contains(e.KeyCode))
@@ -1111,7 +926,7 @@ public sealed class MainForm : Form
 
     private void MainFormOnKeyUp(object? sender, KeyEventArgs e)
     {
-        if (_portSerie is null || !_portSerie.IsOpen)
+        if (!EstConnecte)
             return;
 
         if (!_touchesEnfoncees.Remove(e.KeyCode))
