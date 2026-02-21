@@ -88,6 +88,12 @@ public sealed class MainForm : Form
     private readonly Label _valAgeTelemetrie = new() { AutoSize = true };
     private readonly Label _valRxTx = new() { AutoSize = true };
 
+    private readonly DistancePlotControl _courbeDistance = new()
+    {
+        Dock = DockStyle.Fill,
+        Margin = new Padding(0, 12, 0, 0),
+    };
+
     private bool EstConnecte => _portSerieService.EstConnecte;
 
     public MainForm()
@@ -441,6 +447,7 @@ public sealed class MainForm : Form
         AjouterLigne(grille, 9, "Compteurs", _valRxTx);
 
         _panneauTableauDeBord.Controls.Clear();
+        _panneauTableauDeBord.Controls.Add(_courbeDistance);
         _panneauTableauDeBord.Controls.Add(grille);
         _panneauTableauDeBord.Controls.Add(titre);
     }
@@ -579,6 +586,8 @@ public sealed class MainForm : Form
             _streamActif = false;
             _autoActif = false;
             MettreAJourLibellesActions();
+
+            _courbeDistance.Reset();
         }
     }
 
@@ -801,6 +810,8 @@ public sealed class MainForm : Form
 
         var changements = _core.TraiterLigne(line);
         AppliquerChangementsCarte(changements);
+
+        _courbeDistance.AjouterPoint(DateTime.Now, _core.Etat.DistanceMm);
 
         MettreAJourTexteStatut();
         MettreAJourTableauDeBord();

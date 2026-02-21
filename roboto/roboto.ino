@@ -20,6 +20,10 @@ static const uint8_t REG_GYRO_CONFIG = 0x1B;
 static const uint8_t REG_GYRO_ZOUT_H = 0x47;
 static const float GYRO_SENS_250DPS = 131.0f; // LSB/(deg/s)
 
+// Filtrage gyro : deadband + adaptation lente de l'offset quand le robot est immobile.
+static const float GYRO_DEADBAND_DPS = 0.8f;
+static const float GYRO_OFFSET_ADAPT_ALPHA = 0.0020f;
+
 // Robot pose (reference: depart = (0,0), en mm)
 static int32_t poseXmm = 0;
 static int32_t poseYmm = 0;
@@ -58,6 +62,14 @@ static unsigned long lastDistMs = 0;
 static uint16_t lastDistMm = 0;
 static unsigned long lastEchoUs = 0;
 static const uint16_t DIST_INTERVAL_MS = 90;
+
+// Filtrage distance : ignore les zéros / glitches isolés.
+static const uint16_t DIST_MIN_MM = 25;
+static const uint16_t DIST_MAX_MM = 6000;
+static const uint16_t DIST_MAX_JUMP_MM = 1200; // saute irréaliste en 90ms -> probablement bruit
+static const uint8_t DIST_INVALID_STREAK_FOR_ZERO = 3;
+static uint16_t lastDistGoodMm = 0;
+static uint8_t distInvalidStreak = 0;
 static unsigned long avoidUntilMs = 0;
 static bool avoiding = false;
 
@@ -129,6 +141,13 @@ static void imuUpdateYaw() {
 
 	int16_t raw = imuReadGyroZRaw();
 	float dps = ((float)raw - gyroZOffset) / GYRO_SENS_250DPS;
+	if (fabs(dps) < GYRO_DEADBAND_DPS) dps = 0.0f;
+
+	// Si on est à l'arrêt et que le gyro est proche de 0, on ré-ajuste très lentement l'offset.
+	// Ça limite la dérive (température/offset résiduel) sans perturber les vrais mouvements.
+	if (currentMotion == 'S' && dps == 0.0f) {
+		gyroZOffset = gyroZOffset * (1.0f - GYRO_OFFSET_ADAPT_ALPHA) + (float)raw * GYRO_OFFSET_ADAPT_ALPHA;
+	}
 	yawDeg += dps * ((float)dtMs / 1000.0f);
 	yawDeg = wrapAngleDeg(yawDeg);
 }
@@ -147,8 +166,35 @@ static uint16_t readDistanceMm() {
 	if (dur == 0) return 0;
 	// us to mm: cm = us/58, mm = cm*10
 	uint32_t mm = (uint32_t)(dur * 10UL) / 58UL;
-	if (mm > 6000) mm = 6000;
+	if (mm > DIST_MAX_MM) mm = DIST_MAX_MM;
 	return (uint16_t)mm;
+}
+
+static uint16_t filterDistanceMm(uint16_t rawMm) {
+	// Valeur manifestement invalide
+	bool valid = (rawMm >= DIST_MIN_MM && rawMm <= DIST_MAX_MM);
+
+	// Glitch : saut énorme par rapport à la dernière bonne mesure
+	if (valid && lastDistGoodMm > 0) {
+		uint16_t diff = (rawMm > lastDistGoodMm) ? (rawMm - lastDistGoodMm) : (lastDistGoodMm - rawMm);
+		if (diff > DIST_MAX_JUMP_MM) {
+			valid = false;
+		}
+	}
+
+	if (!valid) {
+		distInvalidStreak++;
+		// Ignore les valeurs erronées isolées : on conserve la dernière bonne mesure.
+		if (lastDistGoodMm > 0 && distInvalidStreak < DIST_INVALID_STREAK_FOR_ZERO) {
+			return lastDistGoodMm;
+		}
+		return 0;
+	}
+
+	// Mesure valide
+	distInvalidStreak = 0;
+	lastDistGoodMm = rawMm;
+	return rawMm;
 }
 
 static void updatePose() {
@@ -453,7 +499,7 @@ static void processLine(char *line) {
 
 	// P = one-shot distance
 	if (cmd == 'P' || cmd == 'p') {
-		uint16_t d = readDistanceMm();
+		uint16_t d = filterDistanceMm(readDistanceMm());
 		bt.print('U');
 		bt.print(',');
 		bt.print(lastEchoUs);
@@ -590,6 +636,8 @@ void setup() {
 	lastTelemMs = millis();
 	lastDistMs = millis();
 	lastDistMm = 0;
+	lastDistGoodMm = 0;
+	distInvalidStreak = 0;
 
 	bt.begin(9600); // HC-06 est typiquement en 9600 par defaut
 }
@@ -604,7 +652,7 @@ void loop() {
 
 	unsigned long now = millis();
 	if (now - lastDistMs >= DIST_INTERVAL_MS) {
-		lastDistMm = readDistanceMm();
+		lastDistMm = filterDistanceMm(readDistanceMm());
 		lastDistMs = now;
 	}
 	uint16_t distMm = lastDistMm;
