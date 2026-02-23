@@ -67,6 +67,11 @@ public sealed class MainForm : Form
 
     private readonly System.Windows.Forms.Timer _timerRafraichissement = new() { Interval = IntervalleRafraichissementUiMs };
 
+    // Décodage télémétrie pour logs lisibles
+    private uint? _dernierTelemRobotMs;
+    private int? _dernierEncGauche;
+    private int? _dernierEncDroite;
+
     // UI tableau de bord (télémétrie + feedback)
     private readonly StatusStrip _barreStatut = new() { SizingGrip = false };
     private readonly ToolStripStatusLabel _statutPrincipal = new() { Spring = true, TextAlign = ContentAlignment.MiddleLeft };
@@ -801,12 +806,12 @@ public sealed class MainForm : Form
                 }
             }
 
-            Journaliser("RX", line);
+            Journaliser("RX", FormaterLigneRxPourJournal(line));
             MettreAJourTableauDeBord();
             return;
         }
 
-        Journaliser("RX", line);
+        Journaliser("RX", FormaterLigneRxPourJournal(line));
 
         var changements = _core.TraiterLigne(line);
         AppliquerChangementsCarte(changements);
@@ -816,6 +821,57 @@ public sealed class MainForm : Form
         MettreAJourTexteStatut();
         MettreAJourTableauDeBord();
         DemanderRafraichissementCarte();
+    }
+
+    private string FormaterLigneRxPourJournal(string line)
+    {
+        // Laisse les lignes déjà explicites (ex: U,<echo_us>)
+        if (line.StartsWith("OK,", StringComparison.OrdinalIgnoreCase))
+            return line;
+
+        if (ProtocoleRobot.TryParseTelemetrie(line, out var t))
+        {
+            var yawDeg = t.YawCdeg / 100.0;
+            var modeText = ModeToText(t.Mode);
+            var motionText = t.Motion == '\0' ? "" : $" motion={t.Motion}";
+
+            string accelText = "";
+            if (t.HasAccel)
+            {
+                var aMag = (int)Math.Round(Math.Sqrt((double)t.AxMg * t.AxMg + (double)t.AyMg * t.AyMg + (double)t.AzMg * t.AzMg));
+                accelText = $" acc=({t.AxMg},{t.AyMg},{t.AzMg})mg |a|={aMag}mg";
+            }
+
+            string dtText = "";
+            if (_dernierTelemRobotMs is uint lastMs)
+            {
+                var dt = unchecked(t.Ms - lastMs);
+                dtText = $" dt={dt}ms";
+            }
+            _dernierTelemRobotMs = t.Ms;
+
+            string encText = "";
+            if (t.HasEncoders)
+            {
+                var deltaText = "";
+                if (_dernierEncGauche is int lastL && _dernierEncDroite is int lastR)
+                {
+                    deltaText = $" dEnc=({t.EncLeft - lastL},{t.EncRight - lastR})";
+                }
+                _dernierEncGauche = t.EncLeft;
+                _dernierEncDroite = t.EncRight;
+
+                encText = $" enc=({t.EncLeft},{t.EncRight}){deltaText}";
+            }
+
+            // Note: la distance affichée dans l'UI/map est filtrée dans le core; ici on montre la valeur brute trame.
+            return $"T ms={t.Ms} x={t.XMm}mm y={t.YMm}mm yaw={yawDeg:F2}° dist={t.DistMm}mm mode={t.Mode}({modeText}){motionText}{encText}{accelText}{dtText}";
+        }
+
+        if (ProtocoleRobot.TryParseDistance(line, out var d))
+            return $"D dist={d}mm";
+
+        return line;
     }
 
     private void AppliquerChangementsCarte(List<CelluleChangee> changements)

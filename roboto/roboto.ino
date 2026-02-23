@@ -1,24 +1,30 @@
-
-#include <SoftwareSerial.h>
+#include <AltSoftSerial.h>
 #include <Wire.h>
 #include <math.h>
 
 // HC-06
-// SoftwareSerial(rxPin, txPin) : rxPin = pin qui RECOIT (Arduino RX)
-static const uint8_t BT_RX_PIN = 7; // relie au TXD du HC-06
-static const uint8_t BT_TX_PIN = 8; // relie au RXD du HC-06
-SoftwareSerial bt(BT_RX_PIN, BT_TX_PIN);
+// IMPORTANT (Uno/Nano) : SoftwareSerial utilise les interruptions PCINT.
+// Comme on utilise PCINT1_vect pour décoder les encodeurs, SoftwareSerial entre en conflit.
+// Solution : AltSoftSerial (n'utilise pas PCINT) avec des pins FIXES :
+//   - RX = D8 (reçoit depuis le TXD du HC-06)
+//   - TX = D9 (envoie vers le RXD du HC-06)
+// Câblage : HC-06 TXD -> D8, HC-06 RXD -> D9 (via diviseur si besoin), GND commun.
+AltSoftSerial bt;
 
 // HC-SR04
-static const uint8_t US_TRIG_PIN = 9;
+// D9 est utilisé par AltSoftSerial (TX), donc on déplace TRIG sur une pin libre.
+static const uint8_t US_TRIG_PIN = 6;
 static const uint8_t US_ECHO_PIN = 10;
 
 // MPU-9250/6500 (I2C)
 static const uint8_t IMU_ADDR = 0x68;
 static const uint8_t REG_PWR_MGMT_1 = 0x6B;
 static const uint8_t REG_GYRO_CONFIG = 0x1B;
+static const uint8_t REG_ACCEL_CONFIG = 0x1C;
+static const uint8_t REG_ACCEL_XOUT_H = 0x3B;
 static const uint8_t REG_GYRO_ZOUT_H = 0x47;
 static const float GYRO_SENS_250DPS = 131.0f; // LSB/(deg/s)
+static const float ACC_SENS_2G = 16384.0f;    // LSB/g
 
 // Filtrage gyro : deadband + adaptation lente de l'offset quand le robot est immobile.
 static const float GYRO_DEADBAND_DPS = 0.8f;
@@ -30,9 +36,32 @@ static int32_t poseYmm = 0;
 static float yawDeg = 0.0f;
 static float gyroZOffset = 0.0f;
 
-// Vitesse lineaire (a calibrer)
-// Sans encodeurs, c'est une estimation. Ajuste cette valeur pour que la map ait une echelle correcte.
-static int32_t LINEAR_SPEED_MM_PER_S = 120; // ~12 cm/s par defaut
+// Encodeurs (quadrature) -> odométrie réelle
+// Sur Uno/Nano, on utilise les Pin Change Interrupts sur A0..A3 (PCINT8..PCINT11)
+static const uint8_t ENC_L_A = A0;
+static const uint8_t ENC_L_B = A1;
+static const uint8_t ENC_R_A = A2;
+static const uint8_t ENC_R_B = A3;
+
+// Paramètres mécaniques (à calibrer sur ton robot chenillé)
+static const float WHEEL_DIAMETER_MM = 45.0f; // diamètre roue d'entraînement de chenille
+static const float WHEEL_BASE_MM = 110.0f;    // distance entre centres des 2 roues (entraxe)
+
+// Encodeur: 48 "ticks" par tour (valeur constructeur). Selon la façon de compter, la résolution effective peut être x1/x2/x4.
+static const int32_t ENC_PPR = 48;
+static const int32_t ENC_DECODING = 4; // 4 = quadrature x4 (compte chaque transition). Mets 1 si ENC_PPR est déjà en x4.
+static const float MM_PER_COUNT = (3.14159265359f * WHEEL_DIAMETER_MM) / (float)(ENC_PPR * ENC_DECODING);
+
+// Si un côté part à l'envers, passe à 1.
+#define ENC_LEFT_INVERT  0
+#define ENC_RIGHT_INVERT 0
+
+static volatile int32_t encLeftCount = 0;
+static volatile int32_t encRightCount = 0;
+static volatile uint8_t encLastLeftState = 0;
+static volatile uint8_t encLastRightState = 0;
+
+// NOTE : l'ancienne odométrie à vitesse fixe a été remplacée par les encodeurs.
 
 // Autonomie
 static const uint16_t OBSTACLE_MM = 200; // si obstacle < 20 cm
@@ -83,6 +112,49 @@ static inline float angleDiffDeg(float target, float current) {
 	return wrapAngleDeg(target - current);
 }
 
+static inline uint8_t readEnc2Bits(uint8_t pinA, uint8_t pinB) {
+	uint8_t a = (uint8_t)(digitalRead(pinA) ? 1 : 0);
+	uint8_t b = (uint8_t)(digitalRead(pinB) ? 1 : 0);
+	return (uint8_t)((a << 1) | b);
+}
+
+static inline int8_t quadDelta(uint8_t prev, uint8_t curr) {
+	// Table quadrature (prev<<2 | curr) => -1,0,+1
+	// 00->01 +1, 01->11 +1, 11->10 +1, 10->00 +1
+	// inverse => -1
+	static const int8_t table[16] = {
+		0,  +1, -1,  0,
+		-1,  0,  0, +1,
+		+1,  0,  0, -1,
+		0,  -1, +1,  0
+	};
+	return table[(prev << 2) | curr];
+}
+
+static inline int32_t iabs32(int32_t v) { return v < 0 ? -v : v; }
+
+static inline int32_t iroundf(float x) {
+	return (int32_t)(x >= 0.0f ? (x + 0.5f) : (x - 0.5f));
+}
+
+ISR(PCINT1_vect) {
+	// Port C = A0..A5, on lit A0..A3
+	uint8_t pinc = PINC;
+	uint8_t la = (pinc & _BV(PC0)) ? 1 : 0;
+	uint8_t lb = (pinc & _BV(PC1)) ? 1 : 0;
+	uint8_t ra = (pinc & _BV(PC2)) ? 1 : 0;
+	uint8_t rb = (pinc & _BV(PC3)) ? 1 : 0;
+	uint8_t left = (uint8_t)((la << 1) | lb);
+	uint8_t right = (uint8_t)((ra << 1) | rb);
+
+	int8_t dl = quadDelta(encLastLeftState, left);
+	int8_t dr = quadDelta(encLastRightState, right);
+	encLastLeftState = left;
+	encLastRightState = right;
+	encLeftCount += (ENC_LEFT_INVERT ? -dl : dl);
+	encRightCount += (ENC_RIGHT_INVERT ? -dr : dr);
+}
+
 static void i2cWrite8(uint8_t addr, uint8_t reg, uint8_t value) {
 	Wire.beginTransmission(addr);
 	Wire.write(reg);
@@ -106,6 +178,25 @@ static bool i2cReadBytes(uint8_t addr, uint8_t startReg, uint8_t *buf, uint8_t l
 	return true;
 }
 
+static bool imuReadAccelRaw(int16_t *ax, int16_t *ay, int16_t *az) {
+	uint8_t b[6];
+	if (!i2cReadBytes(IMU_ADDR, REG_ACCEL_XOUT_H, b, 6)) {
+		*ax = 0;
+		*ay = 0;
+		*az = 0;
+		return false;
+	}
+	*ax = (int16_t)((b[0] << 8) | b[1]);
+	*ay = (int16_t)((b[2] << 8) | b[3]);
+	*az = (int16_t)((b[4] << 8) | b[5]);
+	return true;
+}
+
+static inline int16_t accelRawToMg(int16_t raw) {
+	// mg = raw / 16384 * 1000
+	return (int16_t)((int32_t)raw * 1000L / (int32_t)ACC_SENS_2G);
+}
+
 static int16_t imuReadGyroZRaw() {
 	uint8_t b[2];
 	if (!i2cReadBytes(IMU_ADDR, REG_GYRO_ZOUT_H, b, 2)) {
@@ -119,6 +210,7 @@ static void imuInitAndCalibrate() {
 	i2cWrite8(IMU_ADDR, REG_PWR_MGMT_1, 0x00); // wake
 	delay(50);
 	i2cWrite8(IMU_ADDR, REG_GYRO_CONFIG, 0x00); // +-250 dps
+	i2cWrite8(IMU_ADDR, REG_ACCEL_CONFIG, 0x00); // +-2g
 	delay(10);
 
 	// Calibration offset gyro Z (robot immobile)
@@ -131,6 +223,25 @@ static void imuInitAndCalibrate() {
 	gyroZOffset = (float)sum / (float)samples;
 
 	lastImuMs = millis();
+}
+
+static void encodersInit() {
+	pinMode(ENC_L_A, INPUT_PULLUP);
+	pinMode(ENC_L_B, INPUT_PULLUP);
+	pinMode(ENC_R_A, INPUT_PULLUP);
+	pinMode(ENC_R_B, INPUT_PULLUP);
+
+	noInterrupts();
+	encLeftCount = 0;
+	encRightCount = 0;
+	encLastLeftState = readEnc2Bits(ENC_L_A, ENC_L_B);
+	encLastRightState = readEnc2Bits(ENC_R_A, ENC_R_B);
+
+	// Active PCINT pour le Port C (A0..A5)
+	PCICR |= _BV(PCIE1);
+	// A0..A3 => PCINT8..PCINT11
+	PCMSK1 |= _BV(PCINT8) | _BV(PCINT9) | _BV(PCINT10) | _BV(PCINT11);
+	interrupts();
 }
 
 static void imuUpdateYaw() {
@@ -197,24 +308,60 @@ static uint16_t filterDistanceMm(uint16_t rawMm) {
 	return rawMm;
 }
 
+
 static void updatePose() {
 	unsigned long now = millis();
 	unsigned long dtMs = now - lastPoseMs;
 	if (dtMs == 0) return;
 	lastPoseMs = now;
 
-	if (currentMotion == 'F' || currentMotion == 'f' || currentMotion == 'B' || currentMotion == 'b') {
-		int32_t dir = (currentMotion == 'B' || currentMotion == 'b') ? -1 : 1;
-		int32_t distMm = (int32_t)((int64_t)LINEAR_SPEED_MM_PER_S * (int64_t)dtMs / 1000LL);
-		distMm *= dir;
-		float yawRad = yawDeg * 0.01745329252f;
-		poseXmm += (int32_t)((float)distMm * cos(yawRad));
-		poseYmm += (int32_t)((float)distMm * sin(yawRad));
+	// Lecture des compteurs encodeurs
+	static int32_t lastL = 0;
+	static int32_t lastR = 0;
+
+	int32_t l, r;
+	noInterrupts();
+	l = encLeftCount;
+	r = encRightCount;
+	interrupts();
+
+	int32_t dL = l - lastL;
+	int32_t dR = r - lastR;
+	lastL = l;
+	lastR = r;
+
+	// Si on est à l'arrêt, on ignore les micro variations (bruit) pour éviter une dérive X/Y.
+	// IMPORTANT : ne pas ignorer les 1-tick quand on roule, sinon X/Y peut rester bloqué à 0 si l'encodeur est lent.
+	if (currentMotion == 'S') {
+		return;
 	}
+	if (dL == 0 && dR == 0)
+		return;
+
+	float leftMm = (float)dL * MM_PER_COUNT;
+	float rightMm = (float)dR * MM_PER_COUNT;
+	float ds = (leftMm + rightMm) * 0.5f;
+
+	// On utilise le yaw gyro comme cap (meilleure stabilité qu'un yaw purement odométrique sur chenilles).
+	float yawRad = yawDeg * 0.01745329252f;
+	poseXmm += iroundf(ds * cos(yawRad));
+	poseYmm += iroundf(ds * sin(yawRad));
 }
 
 static void sendTelemetry(uint16_t distMm) {
-	// Format: T,<ms>,<x_mm>,<y_mm>,<yaw_cdeg>,<dist_mm>,<mode>\n
+	// Format: T,<ms>,<x_mm>,<y_mm>,<yaw_cdeg>,<dist_mm>,<mode>,<motion>,<ax_mg>,<ay_mg>,<az_mg>,<encL>,<encR>\n
+	int16_t axRaw, ayRaw, azRaw;
+	imuReadAccelRaw(&axRaw, &ayRaw, &azRaw);
+	int16_t axMg = accelRawToMg(axRaw);
+	int16_t ayMg = accelRawToMg(ayRaw);
+	int16_t azMg = accelRawToMg(azRaw);
+
+	int32_t l, r;
+	noInterrupts();
+	l = encLeftCount;
+	r = encRightCount;
+	interrupts();
+
 	bt.print('T');
 	bt.print(',');
 	bt.print(millis());
@@ -228,6 +375,18 @@ static void sendTelemetry(uint16_t distMm) {
 	bt.print(distMm);
 	bt.print(',');
 	bt.print((int)mode);
+	bt.print(',');
+	bt.print(currentMotion);
+	bt.print(',');
+	bt.print(axMg);
+	bt.print(',');
+	bt.print(ayMg);
+	bt.print(',');
+	bt.print(azMg);
+	bt.print(',');
+	bt.print(l);
+	bt.print(',');
+	bt.print(r);
 	bt.print('\n');
 }
 
@@ -513,15 +672,8 @@ static void processLine(char *line) {
 
 	// V,<mm_per_s> : set linear speed estimate
 	if (cmd == 'V' || cmd == 'v') {
-		char *comma = strchr(line, ',');
-		if (!comma) return;
-		int32_t v;
-		if (!parseInt32(comma + 1, &v)) return;
-		if (v < 20) v = 20;
-		if (v > 500) v = 500;
-		LINEAR_SPEED_MM_PER_S = v;
-		bt.print(F("OK,V,"));
-		bt.print(LINEAR_SPEED_MM_PER_S);
+		// Commande conservée pour compatibilité (ancienne odométrie). Maintenant ignorée.
+		bt.print(F("OK,V,IGNORED"));
 		bt.print('\n');
 		return;
 	}
@@ -632,6 +784,7 @@ void setup() {
 	currentMotion = 'S';
 
 	imuInitAndCalibrate();
+	encodersInit();
 	lastPoseMs = millis();
 	lastTelemMs = millis();
 	lastDistMs = millis();
@@ -700,7 +853,10 @@ void loop() {
 		}
 
 		// Si c'est une commande simple (F/B/S/L/R/A/M/P) envoyee seule, on traite direct.
-		if (lineLen == 1 && (c == 'F' || c == 'f' || c == 'B' || c == 'b' || c == 'S' || c == 's' || c == 'L' || c == 'l' || c == 'R' || c == 'r' || c == 'A' || c == 'a' || c == 'M' || c == 'm' || c == 'P' || c == 'p')) {
+		// IMPORTANT : ne pas traiter A/M/P en direct, car l'appli PC envoie souvent A,0|1 et M,0|1.
+		// Si on traite 'M' dès le 1er caractère, on casse la commande 'M,1' (le reste ",1" devient une ligne invalide).
+		// On garde le traitement direct uniquement pour les commandes de mouvement.
+		if (lineLen == 1 && (c == 'F' || c == 'f' || c == 'B' || c == 'b' || c == 'S' || c == 's' || c == 'L' || c == 'l' || c == 'R' || c == 'r')) {
 			lineBuf[1] = 0;
 			processLine(lineBuf);
 			lineLen = 0;
